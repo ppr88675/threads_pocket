@@ -24,7 +24,7 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: 自動配置 Android 專案與相依修復
+      - name: 自動配置 Android 專案、系統分享選單與相依修復
         run: |
           # 1. 確保 lib/main.dart 放置正確
           mkdir -p lib
@@ -35,12 +35,115 @@ jobs:
           # 2. 自動生成乾淨標準的 Android 專案結構
           flutter create --platforms=android --org app.threads_pocket --project-name threads_pocket .
 
-          # 3. 將 flutter.minSdkVersion 替換為 21（精準支援 Kotlin DSL build.gradle.kts 與 Groovy build.gradle）
+          # 3. 將 flutter.minSdkVersion 替換為 21（支援 Kotlin DSL build.gradle.kts 與 Groovy build.gradle）
           find android/ -name "build.gradle*" -exec sed -i 's/flutter\.minSdkVersion/21/g' {} +
 
-          # 4. 在 AndroidManifest.xml 注入網路存取權限
-          if ! grep -q "android.permission.INTERNET" android/app/src/main/AndroidManifest.xml; then
-            sed -i '/<application/i \    <uses-permission android:name="android.permission.INTERNET" />' android/app/src/main/AndroidManifest.xml
+          # 4. 寫入完整的 AndroidManifest.xml（包含 INTERNET 權限與 Android 系統分享選單 ACTION_SEND 接收器，且移除舊版 package 屬性以相容 AGP 8+）
+          cat << 'EOF' > android/app/src/main/AndroidManifest.xml
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.VIEW" />
+                      <data android:scheme="https" />
+                  </intent>
+              </queries>
+              <application
+                  android:label="Threads 收藏庫"
+                  android:name="${applicationName}"
+                  android:icon="@mipmap/ic_launcher"
+                  android:usesCleartextTraffic="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:theme="@style/LaunchTheme"
+                      android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+                      android:hardwareAccelerated="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <meta-data
+                          android:name="io.flutter.embedding.android.NormalTheme"
+                          android:resource="@style/NormalTheme" />
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter android:label="存入 Threads 收藏庫">
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>
+                      <intent-filter android:label="存入 Threads 收藏庫">
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/*" />
+                      </intent-filter>
+                  </activity>
+                  <meta-data
+                      android:name="flutterEmbedding"
+                      android:value="2" />
+              </application>
+          </manifest>
+          EOF
+
+          # 5. 自動定位 Flutter 產生的 MainActivity.kt 並寫入系統分享接收橋接程式碼（確保 package 名稱 100% 吻合且不重複）
+          MAIN_KT=$(find android/app/src/main/kotlin -name "MainActivity.kt" | head -n 1)
+          if [ -n "$MAIN_KT" ]; then
+            PKG_LINE=$(grep "^package " "$MAIN_KT" | head -n 1)
+            cat << EOF > "$MAIN_KT"
+          $PKG_LINE
+
+          import android.content.Intent
+          import android.os.Bundle
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+
+          class MainActivity : FlutterActivity() {
+              private val CHANNEL = "app.threads_pocket/share"
+              private var initialSharedText: String? = null
+              private var methodChannel: MethodChannel? = null
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  handleSendIntent(intent, isInitial = true)
+              }
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  methodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+                  methodChannel?.setMethodCallHandler { call, result ->
+                      if (call.method == "getInitialSharedText") {
+                          result.success(initialSharedText)
+                          initialSharedText = null
+                      } else {
+                          result.notImplemented()
+                      }
+                  }
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  setIntent(intent)
+                  handleSendIntent(intent, isInitial = false)
+              }
+
+              private fun handleSendIntent(intent: Intent?, isInitial: Boolean) {
+                  if (intent?.action == Intent.ACTION_SEND && intent.type?.startsWith("text/") == true) {
+                      val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)
+                          ?: intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()
+                      if (!sharedText.isNullOrEmpty()) {
+                          if (isInitial || methodChannel == null) {
+                              initialSharedText = sharedText
+                          } else {
+                              initialSharedText = sharedText
+                              methodChannel?.invokeMethod("onSharedText", sharedText)
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
           fi
 
       - name: 下載安裝相依套件
