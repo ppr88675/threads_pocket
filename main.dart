@@ -3,11 +3,11 @@
 // ============================================================================
 // 功能總覽：
 // 1. 貼文解析 (ThreadsParserService)：
-//    - 自動過濾 ?xmt=... / ?igsh=... 等追蹤參數並統一網址格式
-//    - 解析 Open Graph 與內嵌資料，擷取作者名稱、@handle、貼文內文
-//    - 多圖貼文自動僅擷取並顯示「第一張代表圖」(排除純文字貼文的預設圖示)
+//    - 已移除所有嚴格網址格式阻擋，任何從 Threads 複製或分享的連結皆可直接儲存
+//    - 自動清除 ?xmt=... / ?igsh=... 等追蹤參數並保留原始有效網址
+//    - 解析 Open Graph 與內嵌資料，擷取作者名稱、@handle、貼文內文與「第一張代表圖」
 // 2. 手機端極速收藏：
-//    - 支援 Android 系統原生「分享選單 (Share Sheet)」直接傳入網址收藏
+//    - 支援 Android 系統原生「分享選單 (Share Sheet)」：在 Threads 點分享即可選取本 App
 //    - 支援「剪貼簿智慧偵測 (Smart Paste)」，複製連結切回 App 自動彈出收藏提示
 // 3. 瀏覽、管理與檢索：
 //    - 自適應淺色 / 深色模式 (Material 3 Dark/Light Mode)
@@ -17,28 +17,6 @@
 // 4. 純本機端儲存與備份：
 //    - SQLite 離線資料庫 (threads_pocket.db)，無須連網即可翻閱文字與筆記
 //    - 一鍵匯出 / 還原 JSON 備份，換手機可無痛轉移
-//
-// ----------------------------------------------------------------------------
-// 【專案設定檔快速參考】
-// 1. pubspec.yaml 依賴套件：
-//    dependencies:
-//      flutter:
-//        sdk: flutter
-//      http: ^1.2.1
-//      html: ^0.15.4
-//      sqflite: ^2.3.3
-//      path: ^1.9.0
-//      path_provider: ^2.1.3
-//      url_launcher: ^6.3.0
-//
-// 2. AndroidManifest.xml (位於 android/app/src/main/AndroidManifest.xml)：
-//    - 請加入網路權限：<uses-permission android:name="android.permission.INTERNET" />
-//    - 若需啟用「Android 系統分享選單直接存入」，於 <activity android:name=".MainActivity"> 加入：
-//      <intent-filter>
-//          <action android:name="android.intent.action.SEND" />
-//          <category android:name="android.intent.category.DEFAULT" />
-//          <data android:mimeType="text/plain" />
-//      </intent-filter>
 // ============================================================================
 
 import 'dart:async';
@@ -108,7 +86,7 @@ class ThreadsPocketApp extends StatelessWidget {
 /// ============================================================================
 class ThreadPost {
   final int? id;
-  final String url; // 標準化後的乾淨貼文網址
+  final String url; // 貼文網址
   final String authorName; // 作者顯示名稱
   final String authorHandle; // 作者帳號 (例如 @mosseri)
   final String? authorAvatar; // 作者頭像網址
@@ -187,7 +165,7 @@ class ThreadPost {
       id: map['id'] as int?,
       url: map['url'] as String? ?? '',
       authorName: map['author_name'] as String? ?? 'Threads 用戶',
-      authorHandle: map['author_handle'] as String? ?? '@unknown',
+      authorHandle: map['author_handle'] as String? ?? '@threads',
       authorAvatar: map['author_avatar'] as String?,
       content: map['content'] as String? ?? '',
       firstImageUrl: map['first_image_url'] as String?,
@@ -264,6 +242,7 @@ class DatabaseHelper {
 
   /// 檢查網址是否已經收藏過
   Future<bool> existsByUrl(String cleanUrl) async {
+    if (cleanUrl.isEmpty) return false;
     final db = await instance.database;
     final res = await db.query(
       'posts',
@@ -322,54 +301,88 @@ class DatabaseHelper {
 
 /// ============================================================================
 /// 4. Threads 貼文解析服務 (ThreadsParserService)
-///    負責清理追蹤參數、抓取網頁詮釋資料、擷取作者、內文與「第一張代表圖」
+///    不做任何嚴格網址阻擋：只要有輸入文字或網址即可解析與儲存
 /// ============================================================================
 class ThreadsParserService {
-  /// 從任意分享文字中擷取並清理 Threads 網址
-  static String? extractAndCleanThreadsUrl(String rawText) {
-    final regex = RegExp(
-      r'https?:\/\/(?:www\.)?threads\.(?:net|com)\/(?:@[\w\.\-]+\/post\/[\w\-]+|t\/[\w\-]+)',
-      caseSensitive: false,
-    );
-    final match = regex.firstMatch(rawText);
-    if (match == null) return null;
+  /// 從任意分享文字或輸入中提取網址（不做網域限制，永遠不回傳 null 阻擋使用者）
+  static String normalizeInputUrl(String rawText) {
+    final trimmed = rawText.trim();
+    if (trimmed.isEmpty) return '';
 
-    final rawUrl = match.group(0)!;
-    final uri = Uri.tryParse(rawUrl);
-    if (uri == null) return rawUrl;
+    // 若分享文字中夾帶前後說明文字，優先把裡面的 http/https 網址抓出來
+    final urlMatch = RegExp(r'https?:\/\/[^\s]+', caseSensitive: false)
+        .firstMatch(trimmed);
+    String candidate = urlMatch != null ? urlMatch.group(0)! : trimmed;
 
-    // 移除 ?xmt=... 或 ?igsh=... 等追蹤參數，統一網域為 www.threads.net
-    return Uri(
-      scheme: 'https',
-      host: 'www.threads.net',
-      path: uri.path,
-    ).toString();
-  }
-
-  /// 判斷文字是否包含 Threads 連結
-  static bool containsThreadsUrl(String text) {
-    return extractAndCleanThreadsUrl(text) != null;
-  }
-
-  /// 連線抓取並解析貼文資訊（僅保留第一張代表圖）
-  static Future<ThreadPost> fetchPostMetadata(String rawInputUrl) async {
-    final cleanUrl = extractAndCleanThreadsUrl(rawInputUrl);
-    if (cleanUrl == null) {
-      throw const FormatException('找不到有效的 Threads 貼文連結');
+    // 若使用者貼上的是 threads.com/... 或 www.threads.net/... 但少了 https://
+    if (!candidate.startsWith('http://') &&
+        !candidate.startsWith('https://') &&
+        (candidate.contains('threads.') || candidate.contains('/'))) {
+      candidate = 'https://$candidate';
     }
 
-    // 從網址預先解析作者帳號作為保底值
-    String fallbackHandle = '@threads_user';
-    final handleMatch = RegExp(r'/@([\w\.\-]+)/post/').firstMatch(cleanUrl);
+    // 嘗試移除 xmt / igsh 等追蹤參數，但保留原始網域與路徑
+    final uri = Uri.tryParse(candidate);
+    if (uri != null && uri.hasScheme && uri.host.isNotEmpty) {
+      final filteredQuery = Map<String, String>.from(uri.queryParameters)
+        ..remove('xmt')
+        ..remove('igsh')
+        ..remove('utm_source')
+        ..remove('utm_medium');
+
+      return uri
+          .replace(
+            queryParameters: filteredQuery.isEmpty ? null : filteredQuery,
+          )
+          .toString();
+    }
+
+    return candidate;
+  }
+
+  /// 僅用於「自動檢查剪貼簿提示」：判斷剪貼簿內容是否像一個連結
+  static String? detectClipboardLink(String rawText) {
+    final trimmed = rawText.trim();
+    if (trimmed.isEmpty) return null;
+    if (trimmed.contains('threads.com') ||
+        trimmed.contains('threads.net') ||
+        trimmed.startsWith('http://') ||
+        trimmed.startsWith('https://')) {
+      return normalizeInputUrl(trimmed);
+    }
+    return null;
+  }
+
+  /// 連線抓取並解析貼文資訊（僅保留第一張代表圖，失敗時自動保底絕不阻擋儲存）
+  static Future<ThreadPost> fetchPostMetadata(String rawInputUrl) async {
+    final targetUrl = normalizeInputUrl(rawInputUrl);
+
+    // 從網址預先嘗試提取 @帳號 作為保底值
+    String fallbackHandle = '@threads';
+    final handleMatch = RegExp(r'@([\w\.\-]+)').firstMatch(targetUrl);
     if (handleMatch != null) {
       fallbackHandle = '@${handleMatch.group(1)}';
     }
 
+    if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
+      return ThreadPost(
+        url: targetUrl.isNotEmpty
+            ? targetUrl
+            : 'local://note/${DateTime.now().millisecondsSinceEpoch}',
+        authorName: fallbackHandle.replaceFirst('@', ''),
+        authorHandle: fallbackHandle,
+        content: rawInputUrl.trim(),
+        firstImageUrl: null,
+        tags: const [],
+        note: '',
+        savedAt: DateTime.now(),
+      );
+    }
+
     try {
       final response = await http.get(
-        Uri.parse(cleanUrl),
+        Uri.parse(targetUrl),
         headers: {
-          // 使用社群預覽 Bot User-Agent 以確保直接取得完整 Open Graph 標籤與首圖
           'User-Agent':
               'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
           'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
@@ -377,7 +390,7 @@ class ThreadsParserService {
       ).timeout(const Duration(seconds: 12));
 
       if (response.statusCode != 200) {
-        throw HttpException('伺服器回應狀態碼 ${response.statusCode}');
+        throw HttpException('HTTP ${response.statusCode}');
       }
 
       final document = html_parser.parse(utf8.decode(response.bodyBytes));
@@ -390,10 +403,8 @@ class ThreadsParserService {
           '';
       final ogImage = _getMetaContent(document, 'og:image') ??
           _getMetaContent(document, 'twitter:image');
-      final twitterCard = _getMetaContent(document, 'twitter:card') ?? '';
 
       // 解析作者名稱與 @handle
-      // 典型格式: "作者名稱 (@handle) on Threads" 或 "作者名稱 (@handle) • Threads"
       String authorName = fallbackHandle.replaceFirst('@', '');
       String authorHandle = fallbackHandle;
 
@@ -405,11 +416,12 @@ class ThreadsParserService {
       } else if (ogTitle.isNotEmpty) {
         authorName = ogTitle
             .replaceAll(
-                RegExp(r'\s*(on|•)\s*Threads.*$', caseSensitive: false), '')
+                RegExp(r'\s*(on|•|-|\|)\s*Threads.*$', caseSensitive: false),
+                '')
             .trim();
       }
 
-      // 判斷圖片是否為貼文附圖（排除純文字貼文的預設小頭像或官方 Logo）
+      // 擷取第一張代表圖
       String? firstRepresentativeImage;
       String? authorAvatar;
 
@@ -420,22 +432,16 @@ class ThreadsParserService {
       } else if (ogImage != null &&
           ogImage.isNotEmpty &&
           !_isGenericThreadsLogo(ogImage)) {
-        // 若 twitter:card 為 summary_large_image，代表該 og:image 是貼文首張附圖
-        if (twitterCard.toLowerCase() == 'summary_large_image') {
-          firstRepresentativeImage = ogImage;
-        } else {
-          // 純文字貼文時，og:image 通常為作者頭像，將其設為頭像而非貼文大圖
-          authorAvatar = ogImage;
-        }
+        firstRepresentativeImage = ogImage;
       }
 
       final cleanedContent = ogDescription.trim().isNotEmpty
           ? ogDescription.trim()
-          : '（此貼文無文字內容，或僅包含圖片/媒體）';
+          : '（已收藏連結，可點擊「前往原文」查看完整貼文）';
 
       return ThreadPost(
-        url: cleanUrl,
-        authorName: authorName,
+        url: targetUrl,
+        authorName: authorName.isEmpty ? 'Threads 用戶' : authorName,
         authorHandle: authorHandle,
         authorAvatar: authorAvatar,
         content: cleanedContent,
@@ -444,13 +450,13 @@ class ThreadsParserService {
         note: '',
         savedAt: DateTime.now(),
       );
-    } catch (e) {
-      // 若網路受限或解析失敗，仍允許以網址保底儲存，避免遺失連結
+    } catch (_) {
+      // 即使網路連線或解析失敗，也直接回傳可用物件，絕不阻擋儲存
       return ThreadPost(
-        url: cleanUrl,
+        url: targetUrl,
         authorName: fallbackHandle.replaceFirst('@', ''),
         authorHandle: fallbackHandle,
-        content: '（暫時無法自動抓取內文，可點擊「前往原文」查看或手動補充筆記）',
+        content: '（已收藏連結，可點擊「前往原文」查看或手動補充筆記）',
         firstImageUrl: null,
         tags: const [],
         note: '',
@@ -546,7 +552,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _initAndroidShareReceiver();
     // 啟動後延遲檢查一次剪貼簿
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _checkClipboardForThreadsUrl();
+      _checkClipboardForLink();
     });
   }
 
@@ -557,11 +563,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     super.dispose();
   }
 
-  /// 當使用者從 Threads 複製連結切換回本 App 時，自動檢查剪貼簿
+  /// 當使用者切換回本 App 時，自動檢查系統分享與剪貼簿
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      _checkClipboardForThreadsUrl();
+      _checkPendingSharedText();
+      _checkClipboardForLink();
     }
   }
 
@@ -570,42 +577,49 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _shareChannel.setMethodCallHandler((call) async {
       if (call.method == 'onSharedText') {
         final sharedText = call.arguments as String?;
-        if (sharedText != null && sharedText.isNotEmpty) {
+        if (sharedText != null && sharedText.trim().isNotEmpty) {
           _handleIncomingSharedText(sharedText);
         }
       }
     });
 
+    await _checkPendingSharedText();
+  }
+
+  Future<void> _checkPendingSharedText() async {
     try {
       final initialShared =
           await _shareChannel.invokeMethod<String>('getInitialSharedText');
-      if (initialShared != null && initialShared.isNotEmpty) {
+      if (initialShared != null && initialShared.trim().isNotEmpty) {
         _handleIncomingSharedText(initialShared);
       }
-    } catch (_) {
-      // 在尚未配置原生 Channel 的環境中安全忽略
-    }
+    } catch (_) {}
   }
 
   void _handleIncomingSharedText(String sharedText) {
-    final cleanUrl = ThreadsParserService.extractAndCleanThreadsUrl(sharedText);
-    if (cleanUrl != null && mounted) {
-      _openAddOrEditSheet(initialUrl: cleanUrl);
+    final normalized = ThreadsParserService.normalizeInputUrl(sharedText);
+    if (normalized.isNotEmpty && mounted) {
+      _openAddOrEditSheet(initialUrl: normalized);
     }
   }
 
-  /// 智慧剪貼簿偵測：若複製了尚未收藏的 Threads 網址，底部彈出快速收藏提示
-  Future<void> _checkClipboardForThreadsUrl() async {
+  /// 智慧剪貼簿偵測：若複製了尚未收藏的連結，底部彈出快速收藏提示
+  Future<void> _checkClipboardForLink() async {
     try {
       final data = await Clipboard.getData(Clipboard.kTextPlain);
       final text = data?.text ?? '';
-      final cleanUrl = ThreadsParserService.extractAndCleanThreadsUrl(text);
-      if (cleanUrl == null || cleanUrl == _lastPromptedClipboardUrl) return;
+      final detectedUrl = ThreadsParserService.detectClipboardLink(text);
+      if (detectedUrl == null ||
+          detectedUrl.isEmpty ||
+          detectedUrl == _lastPromptedClipboardUrl) {
+        return;
+      }
 
-      final alreadySaved = await DatabaseHelper.instance.existsByUrl(cleanUrl);
+      final alreadySaved =
+          await DatabaseHelper.instance.existsByUrl(detectedUrl);
       if (alreadySaved || !mounted) return;
 
-      _lastPromptedClipboardUrl = cleanUrl;
+      _lastPromptedClipboardUrl = detectedUrl;
       ScaffoldMessenger.of(context).hideCurrentSnackBar();
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -615,13 +629,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             children: [
               Icon(Icons.content_paste_go, color: Colors.white, size: 20),
               SizedBox(width: 10),
-              Expanded(child: Text('偵測到剛複製的 Threads 連結')),
+              Expanded(child: Text('偵測到剪貼簿中的貼文連結')),
             ],
           ),
           action: SnackBarAction(
             label: '立即收藏',
             onPressed: () {
-              _openAddOrEditSheet(initialUrl: cleanUrl);
+              _openAddOrEditSheet(initialUrl: detectedUrl);
             },
           ),
         ),
@@ -662,6 +676,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           post.authorName.toLowerCase().contains(q) ||
           post.authorHandle.toLowerCase().contains(q) ||
           post.note.toLowerCase().contains(q) ||
+          post.url.toLowerCase().contains(q) ||
           post.tags.any((t) => t.toLowerCase().contains(q));
     }).toList();
   }
@@ -731,15 +746,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ),
         actions: [
           IconButton(
-            tooltip: '從剪貼簿快速貼上',
+            tooltip: '從剪貼簿直接貼上',
             icon: const Icon(Icons.content_paste_rounded),
             onPressed: () async {
               final data = await Clipboard.getData(Clipboard.kTextPlain);
-              final text = data?.text ?? '';
-              final cleanUrl =
-                  ThreadsParserService.extractAndCleanThreadsUrl(text);
-              if (cleanUrl != null) {
-                _openAddOrEditSheet(initialUrl: cleanUrl);
+              final text = (data?.text ?? '').trim();
+              if (text.isNotEmpty) {
+                _openAddOrEditSheet(
+                  initialUrl: ThreadsParserService.normalizeInputUrl(text),
+                );
               } else {
                 _openAddOrEditSheet();
               }
@@ -870,7 +885,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             const SizedBox(height: 8),
             Text(
               _allPosts.isEmpty
-                  ? '在 Threads 複製貼文連結後，點擊右下角「新增貼文」或右上角「剪貼簿圖示」即可一鍵解析收藏！'
+                  ? '在 Threads 點擊貼文下方的「分享 ➔ Threads 收藏庫」，或複製連結後點右下角「新增貼文」即可收藏！'
                   : '試著更換搜尋關鍵字或切換上方的分類標籤。',
               textAlign: TextAlign.center,
               style: Theme.of(context).textTheme.bodyMedium?.copyWith(
@@ -910,7 +925,10 @@ class _ThreadPostCardState extends State<ThreadPostCard> {
   bool _isExpanded = false;
 
   Future<void> _openOriginalThread() async {
-    final uri = Uri.tryParse(widget.post.url);
+    final raw = widget.post.url.trim();
+    final uri = Uri.tryParse(
+      raw.startsWith('http') ? raw : 'https://$raw',
+    );
     if (uri != null) {
       await launchUrl(uri, mode: LaunchMode.externalApplication);
     }
@@ -1299,7 +1317,7 @@ class SingleImageLightboxPage extends StatelessWidget {
 
 /// ============================================================================
 /// 8. 新增 / 編輯貼文底部彈窗 (AddOrEditPostSheet)
-///    支援：貼上網址即時解析、預覽第一張代表圖、快速勾選標籤、新增隨手筆記
+///    已完全移除 URL 阻擋驗證：任何連結或文字皆可直接解析與儲存
 /// ============================================================================
 class AddOrEditPostSheet extends StatefulWidget {
   final String? initialUrl;
@@ -1327,7 +1345,6 @@ class _AddOrEditPostSheetState extends State<AddOrEditPostSheet> {
   late final TextEditingController _newTagController;
 
   bool _isParsing = false;
-  String? _parseError;
   late Set<String> _selectedTags;
   late List<String> _tagPool;
 
@@ -1360,7 +1377,7 @@ class _AddOrEditPostSheetState extends State<AddOrEditPostSheet> {
     _selectedTags = {...(existing?.tags ?? [])};
     _tagPool = {...widget.availableTags, ..._selectedTags}.toList();
 
-    // 若是從剪貼簿或分享選單帶入新網址，立即自動解析
+    // 若是從分享選單或剪貼簿帶入新網址，立即自動解析
     if (!_isEditing && _urlController.text.trim().isNotEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _parseUrl();
@@ -1384,43 +1401,43 @@ class _AddOrEditPostSheetState extends State<AddOrEditPostSheet> {
     final raw = _urlController.text.trim();
     if (raw.isEmpty) return;
 
-    setState(() {
-      _isParsing = true;
-      _parseError = null;
-    });
+    setState(() => _isParsing = true);
 
-    try {
-      final parsed = await ThreadsParserService.fetchPostMetadata(raw);
-      if (!mounted) return;
-      setState(() {
-        _urlController.text = parsed.url;
+    final parsed = await ThreadsParserService.fetchPostMetadata(raw);
+    if (!mounted) return;
+    setState(() {
+      _urlController.text = parsed.url;
+      if (_authorNameController.text.trim().isEmpty ||
+          _authorNameController.text == 'Threads 用戶') {
         _authorNameController.text = parsed.authorName;
+      }
+      if (_authorHandleController.text.trim().isEmpty ||
+          _authorHandleController.text == '@threads') {
         _authorHandleController.text = parsed.authorHandle;
+      }
+      if (_contentController.text.trim().isEmpty ||
+          _contentController.text.startsWith('（已收藏連結')) {
         _contentController.text = parsed.content;
-        _imageUrlController.text = parsed.firstImageUrl ?? '';
-        _isParsing = false;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _parseError = e.toString();
-        _isParsing = false;
-      });
-    }
+      }
+      if (parsed.firstImageUrl != null && parsed.firstImageUrl!.isNotEmpty) {
+        _imageUrlController.text = parsed.firstImageUrl!;
+      }
+      _isParsing = false;
+    });
   }
 
   Future<void> _savePost() async {
-    final cleanUrl =
-        ThreadsParserService.extractAndCleanThreadsUrl(_urlController.text) ??
-            _urlController.text.trim();
-    if (cleanUrl.isEmpty) {
-      setState(() => _parseError = '請輸入有效的 Threads 貼文連結');
-      return;
-    }
+    final rawUrl = _urlController.text.trim();
+    final normalizedUrl = ThreadsParserService.normalizeInputUrl(rawUrl);
+
+    // 完全不阻擋儲存：若未填網址則自動產生本地唯一識別碼
+    final finalUrl = normalizedUrl.isNotEmpty
+        ? normalizedUrl
+        : 'local://post/${DateTime.now().millisecondsSinceEpoch}';
 
     final post = ThreadPost(
       id: widget.existingPost?.id,
-      url: cleanUrl,
+      url: finalUrl,
       authorName: _authorNameController.text.trim().isEmpty
           ? 'Threads 用戶'
           : _authorNameController.text.trim(),
@@ -1429,7 +1446,7 @@ class _AddOrEditPostSheetState extends State<AddOrEditPostSheet> {
           : _authorHandleController.text.trim(),
       authorAvatar: widget.existingPost?.authorAvatar,
       content: _contentController.text.trim().isEmpty
-          ? '（無內文摘要）'
+          ? (rawUrl.isNotEmpty ? rawUrl : '（無內文摘要）')
           : _contentController.text.trim(),
       firstImageUrl: _imageUrlController.text.trim().isEmpty
           ? null
@@ -1512,7 +1529,7 @@ class _AddOrEditPostSheetState extends State<AddOrEditPostSheet> {
                     controller: _urlController,
                     decoration: InputDecoration(
                       labelText: 'Threads 貼文連結',
-                      hintText: 'https://www.threads.net/@user/post/...',
+                      hintText: '貼上任何 Threads 分享連結...',
                       border: const OutlineInputBorder(),
                       suffixIcon: IconButton(
                         tooltip: '貼上剪貼簿內容',
@@ -1536,14 +1553,6 @@ class _AddOrEditPostSheetState extends State<AddOrEditPostSheet> {
                 ),
               ],
             ),
-
-            if (_parseError != null) ...[
-              const SizedBox(height: 8),
-              Text(
-                _parseError!,
-                style: const TextStyle(color: Colors.redAccent, fontSize: 12),
-              ),
-            ],
 
             const SizedBox(height: 14),
 
@@ -1590,11 +1599,19 @@ class _AddOrEditPostSheetState extends State<AddOrEditPostSheet> {
 
             // 4. 第一張代表圖片即時預覽
             if (previewImg.isNotEmpty) ...[
-              const Text(
-                '第一張代表圖預覽：',
-                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text(
+                    '第一張代表圖預覽：',
+                    style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                  ),
+                  TextButton(
+                    onPressed: () => setState(() => _imageUrlController.clear()),
+                    child: const Text('移除圖片', style: TextStyle(fontSize: 12)),
+                  ),
+                ],
               ),
-              const SizedBox(height: 6),
               ClipRRect(
                 borderRadius: BorderRadius.circular(10),
                 child: Image.network(
@@ -1671,12 +1688,12 @@ class _AddOrEditPostSheetState extends State<AddOrEditPostSheet> {
 
             const SizedBox(height: 18),
 
-            // 7. 儲存按鈕
+            // 7. 儲存按鈕（解析中也允許隨時直接儲存，不阻擋）
             SizedBox(
               width: double.infinity,
               height: 48,
               child: FilledButton.icon(
-                onPressed: _isParsing ? null : _savePost,
+                onPressed: _savePost,
                 icon: const Icon(Icons.bookmark_added_rounded),
                 label: Text(_isEditing ? '更新收藏' : '確認收藏'),
               ),
@@ -1715,7 +1732,6 @@ class _BackupRestorePageState extends State<BackupRestorePage> {
     final jsonStr = await DatabaseHelper.instance.exportToJson();
     await Clipboard.setData(ClipboardData(text: jsonStr));
 
-    // 同時寫入應用文件目錄供留存
     String savedPath = '';
     try {
       final dir = await getApplicationDocumentsDirectory();
