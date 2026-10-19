@@ -1,0 +1,65 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Threads Pocket Release APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: 檢出專案程式碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Java 17 環境
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 設定 Flutter 環境
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: 自動校正目錄結構與建立 Android 骨架
+        run: |
+          # 1. 確保 lib/main.dart 存在
+          if [ ! -f "lib/main.dart" ] && [ -f "main.dart" ]; then
+            mkdir -p lib
+            cp main.dart lib/main.dart
+          fi
+
+          # 2. 若缺少 android 資料夾則自動生成
+          if [ ! -d "android" ]; then
+            flutter create --platforms=android --org app.threads_pocket --project-name threads_pocket .
+          fi
+
+          # 3. 部署自訂 Android 設定（權限與系統分享選單接收器）
+          if [ -f "android_config/AndroidManifest.xml" ]; then
+            cp android_config/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          elif [ -f "AndroidManifest.xml" ]; then
+            cp AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          fi
+
+          if [ -f "android_config/MainActivity.kt" ]; then
+            mkdir -p android/app/src/main/kotlin/app/threads_pocket
+            cp android_config/MainActivity.kt android/app/src/main/kotlin/app/threads_pocket/MainActivity.kt
+          elif [ -f "MainActivity.kt" ]; then
+            mkdir -p android/app/src/main/kotlin/app/threads_pocket
+            cp MainActivity.kt android/app/src/main/kotlin/app/threads_pocket/MainActivity.kt
+          fi
+
+      - name: 下載安裝相依套件
+        run: flutter pub get
+
+      - name: 編譯 Android Release APK
+        run: flutter build apk --release
+
+      - name: 上傳 APK 安裝檔供下載
+        uses: actions/upload-artifact@v4
+        with:
+          name: Threads-Pocket-Release-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
