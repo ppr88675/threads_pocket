@@ -32,13 +32,11 @@ jobs:
             cp -f main.dart lib/main.dart
           fi
 
-          # 2. 自動生成乾淨標準的 Android 專案結構（確保 Gradle 與 AGP 完全相容）
+          # 2. 自動生成乾淨標準的 Android 專案結構
           flutter create --platforms=android --org app.threads_pocket --project-name threads_pocket .
 
-          # 3. 確保 minSdkVersion 設為 21（sqflite 與現代 Android 核心庫必備）
-          find android/ -name "build.gradle*" -exec sed -i 's/minSdkVersion = flutter.minSdkVersion/minSdkVersion = 21/g' {} +
-          find android/ -name "build.gradle*" -exec sed -i 's/minSdk = flutter.minSdk/minSdk = 21/g' {} +
-          find android/ -name "build.gradle*" -exec sed -i 's/minSdkVersion [0-9]\+/minSdkVersion 21/g' {} +
+          # 3. 將 flutter.minSdkVersion 替換為 21（精準支援 Kotlin DSL build.gradle.kts 與 Groovy build.gradle）
+          find android/ -name "build.gradle*" -exec sed -i 's/flutter\.minSdkVersion/21/g' {} +
 
           # 4. 在 AndroidManifest.xml 注入網路存取權限
           if ! grep -q "android.permission.INTERNET" android/app/src/main/AndroidManifest.xml; then
